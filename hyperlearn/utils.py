@@ -1,14 +1,35 @@
 
-from numpy import uint, newaxis, finfo, float32, float64
+from numpy import uint, newaxis, finfo, float32, float64, zeros
 from .numba import sign, arange
+from numba import njit, prange
 from psutil import virtual_memory
 from .exceptions import FutureExceedsMemory
+from scipy.linalg.blas import dsyrk, ssyrk		# For XTX, XXT
+from scipy.linalg import lapack as _lapack
+from . import numba
+from .base import USE_NUMBA
 
-__all__ = ['svd_flip', 'eig_flip', '_svdCond', '_eighCond',
-			'memoryXTX', 'memoryGram', 'memorySVD', '_float',
-			'traceXTX', 'fastDot', '_XTX', '_XXT']
+__all__ = ['lapack','svd_flip', 'eig_flip', '_svdCond', '_eighCond',
+			'memoryXTX', 'memoryCovariance', 'memorySVD', '_float',
+			'traceXTX', 'fastDot', '_XTX', '_XXT',
+			'rowSum', 'rowSum_A','reflect', 
+			'addDiagonal', 'setDiagonal']
 
 _condition = {'f': 1e3, 'd': 1e6}
+
+def lapack(dtype, function, fast = True, numba = None):
+	"""
+	[Added 11/11/2018]
+	Get a LAPACK function based on the dtype(X). Acts like Scipy.
+	"""
+	f = "_lapack.d"+function
+	if dtype == float32 and fast:
+		f = "_lapack.s"+function
+	if numba != None and USE_NUMBA:
+		try: return eval('numba.'+function)
+		except: pass
+	return eval(f)
+
 
 
 def svd_flip(U, VT, U_decision = True):
@@ -33,17 +54,17 @@ def svd_flip(U, VT, U_decision = True):
 
 
 def eig_flip(V):
-    """
+	"""
 	Flips the signs of V for Eigendecomposition in order to 
 	force deterministic output.
 
 	Follows Sklearn convention by looking at V's maximum in columns
 	as default. This essentially mirrors svd_flip(U_decision = False)
 	"""
-    max_abs_rows = abs(V).argmax(0)
-    signs = sign( V[max_abs_rows, arange(V.shape[1]) ] )
-    V *= signs
-    return V
+	max_abs_rows = abs(V).argmax(0)
+	signs = sign( V[max_abs_rows, arange(V.shape[1]) ] )
+	V *= signs
+	return V
 
 
 
@@ -93,7 +114,7 @@ def memoryXTX(X):
 
 
 
-def memoryGram(X):
+def memoryCovariance(X):
 	"""
 	Computes the memory usage for X.T @ X or X @ X.T so that error messages
 	can be broadcast without submitting to a memory error.
@@ -142,9 +163,10 @@ def _float(data):
 	return data
 
 
-
+@njit(fastmath = True, nogil = True, cache = True)
 def traceXTX(X):
 	"""
+	[Edited 18/10/2018]
 	One drawback of truncated algorithms is that they can't output the correct
 	variance explained ratios, since the full eigenvalue decomp needs to be
 	done. However, using linear algebra, trace(XT*X) = sum(eigenvalues).
@@ -152,10 +174,15 @@ def traceXTX(X):
 	So, this function outputs the trace(XT*X) efficiently without computing
 	explicitly XT*X.
 
-	Note einsum('ij,ij->', X, X) is corret in a sense, but sadly, has less
-	accuracy, hence row sum is formed then total sum.
+	Changes --> now uses Numba which is approx 20% faster.
 	"""
-	return einsum('ij,ij->i', X, X).sum()
+	n, p = X.shape
+	s = 0
+	for i in range(n):
+		for j in range(p):
+			xij = X[i,j]
+			s += xij*xij
+	return s
 
 
 
@@ -200,7 +227,7 @@ def _XTX(XT):
 	compute only the upper triangular which takes slightly
 	less time and memory.
 	"""
-	if XT.dtype == np.float64:
+	if XT.dtype == float64:
 		return dsyrk(1, XT, trans = 0).T
 	return ssyrk(1, XT, trans = 0).T
 
@@ -215,6 +242,104 @@ def _XXT(XT):
 	compute only the upper triangular which takes slightly
 	less time and memory.
 	"""
-	if XT.dtype == np.float64:
+	if XT.dtype == float64:
 		return dsyrk(1, XT, trans = 1).T
 	return ssyrk(1, XT, trans = 1).T
+
+
+
+@njit(fastmath = True, nogil = True, cache = True)
+def rowSum_0(X, norm = False):
+	"""
+	[Added 17/10/2018]
+	Computes rowSum**2 for dense matrix efficiently, instead of using einsum
+	"""
+	n, p = X.shape
+	S = zeros(n, dtype = X.dtype)
+
+	for i in range(n):
+		s = 0
+		Xi = X[i]
+		for j in range(p):
+			Xij = Xi[j]
+			s += Xij*Xij
+		S[i] = s
+	if norm:
+		S**=0.5
+	return S
+
+
+@njit(fastmath = True, nogil = True, cache = True)
+def rowSum_A(X, norm = False):
+	"""
+	[Added 22/10/2018]
+	Computes rowSum**2 for dense array efficiently, instead of using einsum
+	"""
+	n = len(X)
+	s = 0
+	for i in range(n):
+		s += X[i]**2
+	if norm:
+		s **= 0.5
+	return s
+
+
+def rowSum(X, norm = False):
+	"""
+	[Added 22/10/2018]
+	Combines rowSum for matrices and arrays.
+	"""
+	if len(X.shape) > 1:
+		return rowSum_0(X, norm)
+	return rowSum_A(X, norm)
+
+
+def _reflect(X):
+	"""
+	See reflect(X, n_jobs = N) documentation.
+	"""
+	n = len(X)
+	for i in prange(1, n):
+		Xi = X[i]
+		for j in range(i):
+			X[j, i] = Xi[j]
+	return X
+reflect_single = njit(_reflect, fastmath = True, nogil = True, cache = True)
+reflect_parallel = njit(_reflect, fastmath = True, nogil = True, parallel = True)
+
+
+def reflect(X, n_jobs = 1):
+	"""
+	[Added 15/10/2018] [Edited 18/10/2018]
+	Reflects lower triangular of matrix efficiently to upper.
+	Notice much faster than say X += X.T or naive:
+		for i in range(n):
+			for j in range(i, n):
+				X[i,j] = X[j,i]
+	In fact, it is much faster to perform vertically:
+		for i in range(1, n):
+			Xi = X[i]
+			for j in range(i):
+				X[j,i] = Xi[j]
+	The trick is to notice X[i], which reduces array access.
+	"""
+	X = reflect_parallel(X) if n_jobs != 1 else reflect_single(X)
+	return X
+
+
+def addDiagonal(X, c = 1):
+	"""
+	[Added 11/11/2018]
+	Add c to diagonal of matrix
+	"""
+	n = X.shape[0]
+	X.flat[::n+1] += c
+
+def setDiagonal(X, c = 1):
+	"""
+	[Added 11/11/2018]
+	Set c to diagonal of matrix
+	"""
+	n = X.shape[0]
+	X.flat[::n+1] = c
+

@@ -1,18 +1,19 @@
 
-from scipy.linalg import lapack, lu as _lu, qr as _qr
-from scipy.linalg.blas import dsyrk, ssyrk		# For XTX, XXT
+from scipy.linalg import lu as _lu, qr as _qr
 from . import numba
+from numba import njit
 from .base import *
 from .utils import *
 from numpy import float32, float64
 
-__all__ = ['cholesky', 'invCholesky', 'pinvCholesky',
+
+__all__ = ['cholesky', 'invCholesky', 'pinvCholesky', 'cholSolve',
 			'svd', 'lu', 'qr', 
 			'pinv', 'pinvh', 
 			'eigh', 'pinvEig', 'eig']
 
 
-def cholesky(X, alpha = None, fast = True):
+def cholesky(XTX, alpha = None, fast = True):
 	"""
 	Computes the Cholesky Decompsition of a Hermitian Matrix
 	(Positive Symmetric Matrix) giving a Upper Triangular Matrix.
@@ -36,61 +37,167 @@ def cholesky(X, alpha = None, fast = True):
 	Alpha is added for regularization purposes. This prevents system
 	rounding errors and promises better convergence rates.
 	"""
-	n,p = X.shape
-	assert n == p
-	check = 1
-	alpha = ALPHA_DEFAULT if alpha is None else alpha
+	n,p = XTX.shape;  assert n==p
+	error = 1
+	alpha = ALPHA_DEFAULT if alpha == None else alpha
 	old_alpha = 0
 
-	decomp = lapack.dpotrf
-	if fast: decomp = lapack.spotrf if X.dtype == float32 else lapack.dpotrf
+	decomp = lapack(XTX.dtype, "potrf", fast, "cholesky")
 
-	solver = numba.cholesky if USE_NUMBA else decomp
-
-
-	while check != 0:
+	while error != 0:
 		if PRINT_ALL_WARNINGS: 
-			print('Alpha = {}'.format(alpha))
+			print('cholesky Alpha = {}'.format(alpha))
 
 		# Add epsilon jitter to diagonal. Note adding
 		# np.eye(p)*alpha is slower and uses p^2 memory
 		# whilst flattening uses only p memory.
-		X.flat[::n+1] += (alpha - old_alpha)
+		addDiagonal(XTX, alpha-old_alpha)
 		try:
-			cho = solver(X)
+			cho = solver(XTX)
 			if USE_NUMBA: 
 				cho = cho.T
-				check = 0
+				error = 0
 			else:
-				cho, check = cho
+				cho, error = cho
 		except: pass
-		if check != 0:
+		if error != 0:
 			old_alpha = alpha
 			alpha *= 10
 
-
-	X.flat[::n+1] -= alpha
+	addDiagonal(XTX, -alpha)
 	return cho
 
 
-
-def lu(X):
+def cholSolve(A, b, alpha = None):
 	"""
+	[Added 20/10/2018]
+	Faster than direct inverse solve. Finds coefficients in linear regression
+	allowing A @ theta = b.
+	Notice auto adds epsilon jitter if solver fails.
+	"""
+	n,p = A.shape;	assert n == p and b.shape[0] == n
+	error = 1
+	alpha = ALPHA_DEFAULT if alpha is None else alpha
+	old_alpha = 0
+
+	solver = lapack(A.dtype, "potrs")
+
+	while error != 0:
+		if PRINT_ALL_WARNINGS: 
+			print('cholSolve Alpha = {}'.format(alpha))
+
+		# Add epsilon jitter to diagonal. Note adding
+		# np.eye(p)*alpha is slower and uses p^2 memory
+		# whilst flattening uses only p memory.
+		addDiagonal(A, alpha-old_alpha)
+		try:
+			coef, error = solver(A, b)
+		except: pass
+		if error != 0:
+			old_alpha = alpha
+			alpha *= 10
+
+	addDiagonal(A, -alpha)
+	return coef
+
+
+def lu(X, L_only = False, U_only = False):
+	"""
+	[Edited 8/11/2018 Changed to LAPACK LU if L/U only wanted]
 	Computes the LU Decomposition of any matrix with pivoting.
-	Uses Scipy. Will utilise LAPACK later.
+	Provides L only or U only if specified.
+
+	Much faster than Scipy if only U/L wanted, and more memory efficient,
+	since data is altered inplace.
 	"""
-	return _lu(X, permute_l = True, check_finite = False)
+	n, p = X.shape
+	if L_only or U_only:
+
+		A, P, __ = lapack(X.dtype, "getrf")(X)
+		if L_only:
+			A, k = L_process(n, p, A)
+			# inc = -1 means reverse order pivoting
+			A = lapack(X.dtype, "laswp")(a = A, piv = P, inc = -1, k1 = 0, k2 = k-1, overwrite_a = True)
+		else:
+			A = triu_process(n, p, A)
+		return A
+	else:
+		return _lu(X, permute_l = True, check_finite = False)
 
 
-
-def qr(X):
+@njit(fastmath = True, nogil = True, cache = True)
+def L_process(n, p, L):
 	"""
+	Auxiliary function to modify data in place to only get L from LU decomposition.
+	"""
+	wide = (p > n)
+	k = p
+
+	if wide:
+		# wide matrix
+		# L get all n rows, but only n columns
+		L = L[:, :n]
+		k = n
+
+	# tall / wide matrix
+	for i in range(k):
+		li = L[i]
+		li[i+1:] = 0
+		li[i] = 1
+	# Set diagonal to 1
+	return L, k
+
+
+@njit(fastmath = True, nogil = True, cache = True)
+def triu_process(n, p, U):
+	"""
+	Auxiliary function to modify data in place to only get upper triangular
+	part of matrix. Used in QR (get R) and LU (get U) decompositon.
+	"""
+	tall = (n > p)
+	k = n
+
+	if tall:
+		# tall matrix
+		# U get all p rows
+		U = U[:p]
+		k = p
+
+	for i in range(1, k):
+		U[i, :i] = 0
+	return U
+
+
+
+def qr(X, Q_only = False, R_only = False, overwrite = False):
+	"""
+	[Edited 8/11/2018 Added Q, R only parameters. Faster than Numba]
+	[Edited 9/11/2018 Made R only more memory efficient (no data copying)]
 	Computes the reduced QR Decomposition of any matrix.
 	Uses optimized NUMBA QR if avaliable else use's Scipy's
 	version.
+
+	Provides Q or R only if specified, and is must faster + more memory
+	efficient since data is changed inplace.
 	"""
+	if Q_only or R_only:
+		# Compute R
+		n, p = X.shape
+		R, tau, __, __ = lapack(X.dtype, "geqrf")(X, overwrite_a = overwrite)
+
+		if Q_only:
+			if p > n:
+				R = R[:, :n]
+			# Compute Q
+			Q, __, __ = lapack(X.dtype, "orgqr")(R, tau, overwrite_a = True)
+			return Q
+		else:
+			# Do nothing, as R is already computed.
+			R = triu_process(n, p, R)
+			return R
+
 	if USE_NUMBA: return numba.qr(X)
-	return _qr(X, mode = 'economic', check_finite = False)
+	return _qr(X, mode = 'economic', check_finite = False, overwrite_a = overwrite)
 
 
 
@@ -101,7 +208,7 @@ def invCholesky(X, fast = False):
 	Upper Triangular Matrix.
 	
 	This is used in conjunction in solveCholesky, where the
-	inverse of the gram matrix is needed.
+	inverse of the covariance matrix is needed.
 	
 	Speed
 	--------------
@@ -117,10 +224,8 @@ def invCholesky(X, fast = False):
 	However, speeds are reduced by 50%.
 	"""
 	assert X.shape[0] == X.shape[1]
-	inverse = lapack.dtrtri
-	if fast: inverse = lapack.strtri if X.dtype == float32 else lapack.dtrtri
-		
-	choInv = inverse(X)[0]
+	choInv = lapack(X.dtype, "trtri", fast)(X)[0]
+
 	return choInv @ choInv.T
 
 	
@@ -153,10 +258,10 @@ def pinvCholesky(X, alpha = None, fast = False):
 	"""
 	n,p = X.shape
 	XT = X.T
-	memoryGram(X)
-	gram = _XTX(XT) if n >= p else _XXT(XT)
+	memoryCovariance(X)
+	covariance = _XTX(XT) if n >= p else _XXT(XT)
 	
-	cho = cholesky(gram, alpha = alpha, fast = fast)
+	cho = cholesky(covariance, alpha = alpha, fast = fast)
 	inv = invCholesky(cho, fast = fast)
 	
 	return inv @ XT if n >= p else XT @ inv
@@ -165,6 +270,7 @@ def pinvCholesky(X, alpha = None, fast = False):
 
 def svd(X, fast = True, U_decision = False, transpose = True):
 	"""
+	[Edited 9/11/2018 --> Modern Big Data Algorithms p/n ratio check]
 	Computes the Singular Value Decomposition of any matrix.
 	So, X = U * S @ VT. Note will compute svd(X.T) if p > n.
 	Should be 99% same result. This means this implementation's
@@ -189,21 +295,22 @@ def svd(X, fast = True, U_decision = False, transpose = True):
 	This flips the signs of U and VT, using VT_based decision.
 	"""
 	transpose = True if (transpose and X.shape[1] > X.shape[0]) else False
-	if X.dtype not in (float32, float64):
-		X = X.astype(float32)
+	X = _float(X)
+	dtype = X.dtype
 	if transpose: 
-		X, U_decision = X.T, ~U_decision
+		X, U_decision = X.T, not U_decision
 
+	n, p = X.shape
+	ratio = p/n
 	#### TO DO: If memory usage exceeds LWORK, use GESVD
-	if USE_NUMBA:
-		U, S, VT = numba.svd(X)
+	if ratio >= 0.001:
+		if USE_NUMBA:
+			U, S, VT = numba.svd(X)
+		else:
+			#### TO DO: If memory usage exceeds LWORK, use GESVD
+			U, S, VT, __ = lapack(dtype, "gesdd", fast)(X, full_matrices = False)
 	else:
-		#### TO DO: If memory usage exceeds LWORK, use GESVD
-
-		_svd = lapack.dgesdd
-		if fast: _svd = lapack.sgesdd if X.dtype == float32 else lapack.dgesdd
-
-		U, S, VT, __ = _svd(X, full_matrices = 0)
+		U, S, VT = lapack(dtype, "gesvd", fast)(X, full_matrices = False)
 		
 	U, VT = svd_flip(U, VT, U_decision = U_decision)
 	
@@ -239,16 +346,13 @@ def pinv(X, alpha = None, fast = True):
 	if alpha is not None: assert alpha >= 0
 	alpha = 0 if alpha is None else alpha
 	
-#     if USE_NUMBA:
-#         return numba.pinv(X)
-#     else:
 	U, S, VT = svd(X, fast = fast)
 	U, S, VT = _svdCond(U, S, VT, alpha)
 	return (VT.T * S) @ U.T
 	
 
 
-def eigh(XTX, alpha = None, fast = True, svd = False, positive = False):
+def eigh(XTX, alpha = None, fast = True, svd = False, positive = False, qr = False):
 	"""
 	Computes the Eigendecomposition of a Hermitian Matrix
 	(Positive Symmetric Matrix).
@@ -286,38 +390,37 @@ def eigh(XTX, alpha = None, fast = True, svd = False, positive = False):
 	"""
 	n,p = XTX.shape
 	assert n == p
-	check = 1
+	error = 1
 	alpha = ALPHA_DEFAULT if alpha is None else alpha
 	old_alpha = 0
 	
-	eig = lapack.dsyevd
-	if fast: eig = lapack.ssyevd if XTX.dtype == float32 else lapack.dsyevd
-			
-	solver = numba.eigh if USE_NUMBA else eig
+	if not qr:
+		eig = lapack(X.dtype, "syevd", fast, "eigh")
+	else:
+		eig = lapack(X.dtype, "syevr", fast, "eigh")
 
 
-	while check != 0:
+	while error != 0:
 		if PRINT_ALL_WARNINGS: 
-			print('Alpha = {}'.format(alpha))
+			print('eigh Alpha = {}'.format(alpha))
 
 		# Add epsilon jitter to diagonal. Note adding
 		# np.eye(p)*alpha is slower and uses p^2 memory
 		# whilst flattening uses only p memory.
-		XTX.flat[::n+1] += (alpha - old_alpha)
+		addDiagonal(XTX, alpha-old_alpha)
 		try:
 			output = solver(XTX)
 			if USE_NUMBA: 
 				S2, V = output
-				check = 0
+				error = 0
 			else: 
-				S2, V, check = output
+				S2, V, error = output
 		except: pass
-		if check != 0:
+		if error != 0:
 			old_alpha = alpha
 			alpha *= 10
 
-
-	XTX.flat[::n+1] -= alpha
+	addDiagonal(XTX, -alpha)
 	S2, V = S2[::-1], eig_flip(V[:,::-1])
 
 	if svd or positive: 
@@ -331,13 +434,14 @@ def eigh(XTX, alpha = None, fast = True, svd = False, positive = False):
 _svd = svd
 def eig(X, alpha = None, fast = True, U_decision = False, svd = False, stable = False):
 	"""
+	[Edited 8/11/2018 Made QR-SVD even faster --> changed to n >= p from n >= 5/3p]
 	Computes the Eigendecomposition of any matrix using either
 	QR then SVD or just SVD. This produces much more stable solutions 
-	that pure eigh(gram), and thus will be necessary in some cases.
+	that pure eigh(covariance), and thus will be necessary in some cases.
 
 	If STABLE is True, then EIGH will be bypassed, and instead SVD or QR/SVD
 	will be used instead. This is to guarantee stability, since EIGH
-	uses epsilon jitter along the diagonal of the gram matrix.
+	uses epsilon jitter along the diagonal of the covariance matrix.
 	
 	Speed
 	--------------
@@ -369,22 +473,24 @@ def eig(X, alpha = None, fast = True, U_decision = False, svd = False, stable = 
 
 	# Note when p >= n, EIGH will return incorrect results, and hence HyperLearn
 	# will default to SVD or QR/SVD
-	if stable or ~memCheck or p > n:
-		if n >= 5/3*p:
+	if stable or not memCheck or p > n:
+		# From Daniel Han-Chen's Modern Big Data Algorithms --> if n is larger
+		# than p, then use QR. Old is >= 5/3*p.
+		if n >= p:
 			# Q, R = qr(X)
 			# U, S, VT = svd(R)
 			# S, VT is kept.
-			__, S, V = _svd( qr(X)[1], fast = fast, U_decision = U_decision)
+			__, S, V = _svd( qr(X, R_only = True), fast = fast, U_decision = U_decision)
 		else:
 			# Force turn on transpose:
 			# either computes svd(X) or svd(X.T)
 			# whichever is faster. [p >= n --> svd(X.T)]
 			__, S, V = _svd(X, transpose = True, fast = fast, U_decision = U_decision)
-		if ~svd:
+		if not svd:
 			S **= 2
 			V = V.T
 	else:
-		S, V = eigh(_XTX(X.T), U_decision = U_decision, fast = fast, alpha = alpha)
+		S, V = eigh(_XTX(X.T), fast = fast, alpha = alpha)
 		if svd:
 			S **= 0.5
 			V = V.T
@@ -434,7 +540,7 @@ def pinvh(XTX, alpha = None, fast = True):
 def pinvEig(X, alpha = None, fast = True):
 	"""
 	Computes the approximate pseudoinverse of any matrix X
-	using Eigendecomposition on the gram matrix XTX or XXT
+	using Eigendecomposition on the covariance matrix XTX or XXT
 	
 	Uses a special trick where:
 		If n >= p: X^-1 approx = (XT @ X)^-1 @ XT
@@ -462,10 +568,10 @@ def pinvEig(X, alpha = None, fast = True):
 	"""
 	n,p = X.shape
 	XT = X.T
-	memoryGram(X)
-	gram = _XTX(XT) if n >= p else _XXT(XT)
+	memoryCovariance(X)
+	covariance = _XTX(XT) if n >= p else _XXT(XT)
 	
-	S2, V = eigh(gram, alpha = alpha, fast = fast)
+	S2, V = eigh(covariance, alpha = alpha, fast = fast)
 	S2, V = _eighCond(S2, V)
 	inv = (V / S2) @ V.T
 

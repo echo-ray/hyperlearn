@@ -1,13 +1,16 @@
 
 from .linalg import *
 from .base import *
-from .utils import _svdCond, _float, _XTX, _XXT
+from .utils import _svdCond, _float, _XTX, _XXT, fastDot
 from .numba import lstsq as _lstsq
 from .big_data import LSMR
-from numpy import newaxis
+from numpy import newaxis, cumsum, sqrt, hstack
+from .big_data.randomized import randomizedSVD
+from .big_data.truncated import truncatedEig
 
 
-__all__ = ['solve', 'solveCholesky', 'solveSVD', 'solveEig', 'lstsq']
+__all__ = ['solve', 'solveCholesky', 'solveSVD', 'solveEig', 'solvePartial', 'lstsq',
+			'solveTLS']
 
 
 def solve(X, y, tol = 1e-6, condition_limit = 1e8, alpha = None, weights = None, copy = False,
@@ -89,17 +92,16 @@ def solve(X, y, tol = 1e-6, condition_limit = 1e8, alpha = None, weights = None,
 			X *= W
 			y *= weights
 
-	
 	alpha = 0 if alpha is None else alpha
 
-	good = True
-	while ~good:
+	good = False
+	while not good:
 		theta_hat, good = LSMR(X, y, tol = tol, condition_limit = condition_limit, alpha = alpha,
 								non_negative = non_negative, max_iter = max_iter)
 		alpha = ALPHA_DEFAULT if alpha == 0 else alpha*10
 
 	# Return X back to its original state
-	if ~copy and weights is not None:
+	if not copy and weights is not None:
 		X /= W
 		y /= weights
 
@@ -108,10 +110,12 @@ def solve(X, y, tol = 1e-6, condition_limit = 1e8, alpha = None, weights = None,
 	
 
 
-def solveCholesky(X, y, alpha = None, fast = False):
+def solveCholesky(X, y, alpha = None, fast = True):
 	"""
 	[Added 23/9/2018 added matrix multiplication decisions (faster multiply)
 	 ie: if (XTX)^1(XTy) or ((XTX)^-1XT)y is faster]
+	[Edited 20/10/2018 Major update - added LAPACK cholSolve --> 20% faster]
+	[Edited 30/10/2018 Reduced RAM usage by clearing unused variables]
 
 	Computes the Least Squares solution to X @ theta = y using Cholesky
 	Decomposition. This is the default solver in HyperLearn.
@@ -144,25 +148,36 @@ def solveCholesky(X, y, alpha = None, fast = False):
 	Stability
 	--------------
 	Note that LAPACK's single precision (float32) solver (strtri) is much more
-	unstable than double (float64). So, default strtri is OFF.
-	However, speeds are reduced by 50%.
+	unstable than double (float64). You might see stability problems if FAST = TRUE.
+	Set it to FALSE if theres issues.
 	"""
 	n,p = X.shape
-	X = _float(X)
+	X, y = _float(X), _float(y)
 	XT = X.T
-	gram = _XTX(XT) if n >= p else _XXT(XT)
+	covariance = _XTX(XT) if n >= p else _XXT(XT)
 	
-	cho = cholesky(gram, alpha = alpha, fast = fast)
-	inv = invCholesky(cho, fast = fast)
-
-	return fastDot(inv, XT, y) if n >= p else fastDot(XT, inv, y)
+	cho = cholesky(covariance, alpha = alpha, fast = fast)
+	del covariance; covariance = None; # saving memory
 
 
+	if n >= p:
+		# Use spotrs solve from LAPACK
+		return cholSolve(cho, XT @ y, alpha = alpha)
+	else:
+		inv = invCholesky(cho, fast = fast)
+		return fastDot(XT, inv, y)
 
-def solveSVD(X, y, alpha = None, fast = True):
+	#return fastDot(inv, XT, y) if n >= p else fastDot(XT, inv, y)
+	
+
+
+
+def solveSVD(X, y, n_components = None, alpha = None, fast = True):
 	"""
+	[Edited 6/11/2018 Added n_components for Partial Solving]
 	Computes the Least Squares solution to X @ theta = y using SVD.
-	Slow, but most accurate.
+	Slow, but most accurate. Specify n_components to reduce overfitting.
+	Heurestic is 95% of variance is captured, if set to 'auto'.
 	
 	Optional alpha is used for regularization purposes.
 	
@@ -182,11 +197,55 @@ def solveSVD(X, y, alpha = None, fast = True):
 		float32 = 1e3 * eps * max(S)
 		float64 = 1e6 * eps * max(S)
 	"""
-	if alpha is not None: assert alpha >= 0
+	if alpha != None: assert alpha >= 0
 	alpha = 0 if alpha is None else alpha
-	X = _float(X)
+	X, y = _float(X), _float(y)
 
 	U, S, VT = svd(X, fast = fast)
+	U, S, VT = _svdCond(U, S, VT, alpha)
+
+	if type(n_components) == float:
+		if n_components > 1:
+			n_components = int(n_components)
+
+	if n_components == 'auto' or type(n_components) == int:
+		# Notice heuristic of 90% variance explained.
+		s = S / S.sum()
+		s = cumsum(s)
+
+		if n_components == 'auto':
+			for i in range(len(s)):
+				if s[i] >= 0.9: break
+		else:
+			i = n_components
+		U, S, VT = U[:,:i], S[:i], VT[:i]
+
+	return fastDot(VT.T * S,   U.T,   y)
+
+
+
+def solvePartial(X, y, n_components = None, alpha = None, fast = True):
+	"""
+	[Added 6/11/2018]
+	Computes the Least Squares solution to X @ theta = y using Randomized SVD.
+	Much faster than normal SVD solving, and is not prone is overfitting.
+	
+	Optional alpha is used for regularization purposes.
+	"""
+	if alpha != None: assert alpha >= 0
+	alpha = 0 if alpha is None else alpha
+
+	if n_components == None or n_components == 'auto':
+		# will provide approx sqrt(p) - 1 components.
+		# A heuristic, so not guaranteed to work.
+		k = int(sqrt(X.shape[1]))-1
+		if k <= 0: k = 1
+	else:
+		k = int(n_components) if n_components > 0 else 1
+
+	X, y = _float(X), _float(y)
+
+	U, S, VT = randomizedSVD(X, k)
 	U, S, VT = _svdCond(U, S, VT, alpha)
 	
 	return fastDot(VT.T * S,   U.T,   y)
@@ -195,6 +254,8 @@ def solveSVD(X, y, alpha = None, fast = True):
 
 def solveEig(X, y, alpha = None, fast = True):
 	"""
+	[Edited 30/10/2018 Reduced RAM usage by clearing unused variables]
+	
 	Computes the Least Squares solution to X @ theta = y using
 	Eigendecomposition on the covariance matrix XTX or XXT.
 	Medium speed and accurate, where this lies between
@@ -225,14 +286,14 @@ def solveEig(X, y, alpha = None, fast = True):
 	rounding errors and promises better convergence rates.
 	"""
 	n,p = X.shape
-	X = _float(X)
+	X, y = _float(X), _float(y)
 	XT = X.T
-	gram = _XTX(XT) if n >= p else _XXT(XT)
+	covariance = _XTX(XT) if n >= p else _XXT(XT)
 	
-	inv = pinvh(gram, alpha = alpha, fast = fast)
+	inv = pinvh(covariance, alpha = alpha, fast = fast)
+	del covariance; covariance = None; # saving memory
 
 	return fastDot(inv, XT, y) if n >= p else fastDot(XT, inv, y)
-
 
 
 
@@ -241,7 +302,44 @@ def lstsq(X, y):
 	Returns normal Least Squares solution using LAPACK and Numba if
 	installed. PyTorch will default to Cholesky Solve.
 	"""
-	X,y = _float(X), _float(y)
+	X, y = _float(X), _float(y)
 	return _lstsq(X, y)
 
+
+
+def solveTLS(X, y, solver = 'truncated'):
+	"""
+	[Added 6/11/2018]
+	Performs Total Least Squares based on the implementation in Wikipedia:
+	https://en.wikipedia.org/wiki/Total_least_squares.
+	The naming is rather deceptive, as it doesn't mean it'll yield better
+	results than pure SVD solving.
+	Normal linear regression assumes Y|X has gaussian noise. TLS assumes this
+	AND X|Y has noise.
+
+	Two solvers - full, truncated. Truncated is much much faster, as smallest
+	eigen component is needed. Full solver uses Eigendecomposition, which is
+	much much slower, but more accurate.
+	"""
+	p = X.shape[1]
+	X, y = _float(X), _float(y)
+	if len(y.shape) > 1:
+		print("solveTLS works only on single column Ys.")
+		return
+	Z = hstack((X, y[:, newaxis]))
+
+	if solver == 'full':
+		__, V = eig(Z)
+
+		VXY = V[:p, p]
+		VYY = V[p:, p]
+	else:
+		# Uses truncatedEig
+		V = truncatedEig(Z, 1, which = 'smallest')[1].flatten()
+		VXY = V[:p]
+		VYY = V[p]
+
+	theta_hat = -VXY / VYY
+
+	return theta_hat
 

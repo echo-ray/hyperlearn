@@ -7,7 +7,7 @@ from .randomized import randomizedSVD, randomizedEig
 from ..exceptions import PartialWrongShape
 
 
-def _util(batch, S, VT, eig = False):
+def _utilSVD(batch, S, VT, eig = False):
 	"""
 	Batch (nrows, ncols)
 	S (ncomponents)
@@ -68,18 +68,16 @@ def partialSVD(batch, S, VT, ratio = 1, solver = 'full', tol = None, max_iter = 
 
 		You can also get U partially and slowly using reverseU.
 	"""
-	data, k, __ = _util(batch, S, VT, eig = False)
+	data, k, __ = _utilSVD(batch, S, VT, eig = False)
 
 	if solver == 'full':
-		S, VT = eig(data, svd = True)
-		return S, VT
-
+		U, S, VT = svd(data)
 	elif solver == 'truncated':
-		__, S, VT = truncatedSVD(data, n_components = k, tol = tol)
+		U, S, VT = truncatedSVD(data, n_components = k, tol = tol)
 	else:
-		__, S, VT = randomizedSVD(data, n_components = k, max_iter = max_iter)
+		U, S, VT = randomizedSVD(data, n_components = k, max_iter = max_iter)
 
-	return S[:k], VT[:k]
+	return U[k:,:k], S[:k], VT[:k]
 
 
 
@@ -111,7 +109,7 @@ def partialEig(batch, S2, V, ratio = 1, solver = 'full', tol = None, max_iter = 
 			Same as truncated, but instead of using ARPACK, uses
 			randomized Eig.
 	"""
-	data, k, memCheck = _util(batch, S2, V, eig = True)
+	data, k, memCheck = _utilSVD(batch, S2, V, eig = True)
 
 	if solver == 'full':
 		S2, V = eig(data, svd = False)
